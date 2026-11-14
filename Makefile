@@ -10,6 +10,7 @@ export ARCHS = arm64
 TWEAK_NAME ?= uYouEnhanced
 DISPLAY_NAME ?= YouTube
 BUNDLE_ID ?= com.google.ios.youtube
+AUDIO_EQ_ENABLED ?= 1
 
 ifndef YOUTUBE_VERSION
 YOUTUBE_VERSION = 21.20.4
@@ -23,7 +24,17 @@ PACKAGE_VERSION = $(YOUTUBE_VERSION)-$(UYOU_VERSION)
 $(TWEAK_NAME)_FILES := $(wildcard Sources/*.xm) $(wildcard Sources/*.x) $(wildcard Sources/*.m)
 $(TWEAK_NAME)_FRAMEWORKS = UIKit Foundation AVFoundation AVKit Photos Accelerate CoreMotion GameController VideoToolbox Security MediaPlayer JavaScriptCore
 $(TWEAK_NAME)_LIBRARIES = bz2 c++ iconv z sqlite3
-$(TWEAK_NAME)_CFLAGS = -fobjc-arc -Wno-deprecated-declarations -Wno-unused-but-set-variable -Wno-nullability-completeness -DTWEAK_VERSION=\"$(PACKAGE_VERSION)\"
+$(TWEAK_NAME)_CFLAGS = -Wno-deprecated-declarations -Wno-unused-but-set-variable -Wno-nullability-completeness -DUYOU_AUDIO_EQ_ENABLED=$(AUDIO_EQ_ENABLED) -DTWEAK_VERSION=\"$(PACKAGE_VERSION)\"
+$(TWEAK_NAME)_OBJCFLAGS = -fobjc-arc
+
+ifeq ($(AUDIO_EQ_ENABLED),1)
+$(TWEAK_NAME)_FILES += Addons/AudioEQ/Tweak.xm Addons/AudioEQ/AudioHooks.mm Addons/AudioEQ/AudioDSP.cpp Addons/AudioEQ/Settings.mm Addons/AudioEQ/Vendor/fishhook.c
+$(TWEAK_NAME)_FRAMEWORKS += AudioToolbox CoreMedia
+$(TWEAK_NAME)_CCFLAGS += -std=c++17 -fexceptions -fcxx-exceptions
+$(TWEAK_NAME)_OBJCFLAGS += -fobjc-exceptions
+Addons/AudioEQ/AudioHooks.mm_CFLAGS += -Drebind_symbols=YTAEQRebindSymbols -Drebind_symbols_image=YTAEQRebindSymbolsImage
+Addons/AudioEQ/Vendor/fishhook.c_CFLAGS += -Drebind_symbols=YTAEQRebindSymbols -Drebind_symbols_image=YTAEQRebindSymbolsImage
+endif
 
 export libcolorpicker_ARCHS = arm64
 export libFLEX_ARCHS = arm64
@@ -68,6 +79,9 @@ endif
 $(TWEAK_NAME)_EMBED_LIBRARIES = $(THEOS_OBJ_DIR)/libcolorpicker.dylib
 $(TWEAK_NAME)_EMBED_FRAMEWORKS = $(_THEOS_LOCAL_DATA_DIR)/$(THEOS_OBJ_DIR_NAME)/install_Alderis.xcarchive/Products/var/jb/Library/Frameworks/Alderis.framework
 $(TWEAK_NAME)_EMBED_BUNDLES = $(wildcard Bundles/*.bundle)
+ifeq ($(AUDIO_EQ_ENABLED),1)
+$(TWEAK_NAME)_EMBED_BUNDLES += Addons/AudioEQ/Resources/YTAudioEQ.bundle
+endif
 $(TWEAK_NAME)_EMBED_EXTENSIONS = $(wildcard Extensions/*.appex)
 
 INSTALL_TARGET_PROCESSES = YouTube
@@ -83,7 +97,7 @@ UYOU_BUNDLE = $(UYOU_PATH)/Library/Application\ Support/uYouBundle.bundle
 include $(THEOS)/makefiles/common.mk
 
 ifneq ($(JAILBROKEN),1)
-SUBPROJECTS += Tweaks/Alderis Tweaks/DontEatMyContent Tweaks/FLEXing/libflex Tweaks/Return-YouTube-Dislikes Tweaks/YTABConfig Tweaks/YouGroupSettings Tweaks/YTIcons Tweaks/YouLoop Tweaks/YouPiP Tweaks/YouQuality Tweaks/YouSlider Tweaks/YouSpeed Tweaks/YouTimeStamp Tweaks/YTHoldForSpeed Tweaks/YTVideoOverlay Tweaks/YTweaks Tweaks/YouTubeLegacy
+SUBPROJECTS += Tweaks/Alderis Tweaks/DontEatMyContent Tweaks/FLEXing/libflex Tweaks/Return-YouTube-Dislikes Tweaks/YTABConfig Tweaks/YouGroupSettings Tweaks/YTIcons Tweaks/YouLoop Tweaks/YouMute Tweaks/YouPiP Tweaks/YouQuality Tweaks/YouSlider Tweaks/YouSpeed Tweaks/YouTimeStamp Tweaks/YTHoldForSpeed Tweaks/YTVideoOverlay Tweaks/YTweaks Tweaks/YouTubeLegacy
 ifeq ($(SPONSORBLOCK_ENABLED),1)
 SUBPROJECTS += Tweaks/iSponsorBlock
 endif
@@ -119,12 +133,16 @@ before-all::
 	$(PRINT_FORMAT_BLUE) "uYou rebranded to 3.0.5 (Unofficial Build)";
 
 before-package::
-	@bash tools/stage-ffmpeg.sh "$(THEOS_PROJECT_DIR)/Bundles"
+	@bash Tools/stage-ffmpeg.sh "$(THEOS_PROJECT_DIR)/Bundles"
 
 else
 before-package::
 	@mkdir -p $(THEOS_STAGING_DIR)/Library/Application\ Support; cp -r Localizations/uYouPlus.bundle $(THEOS_STAGING_DIR)/Library/Application\ Support/
 endif
 after-stage::
-	@bash tools/stage-ffmpeg.sh "$(THEOS_STAGING_DIR)"
+	@bash Tools/stage-ffmpeg.sh "$(THEOS_STAGING_DIR)"
+ifeq ($(JAILBROKEN)$(AUDIO_EQ_ENABLED),11)
+	@mkdir -p "$(THEOS_STAGING_DIR)/Library/Application Support"
+	@cp -R Addons/AudioEQ/Resources/YTAudioEQ.bundle "$(THEOS_STAGING_DIR)/Library/Application Support/"
+endif
 

@@ -1,0 +1,68 @@
+name: Audio EQ checks
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'Addons/AudioEQ/**'
+      - 'Scripts/audio-eq/**'
+      - 'Tools/test-audio-eq.sh'
+      - 'Sources/uYouPlusSettings.xm'
+      - 'Makefile'
+      - '.github/workflows/**'
+  push:
+    paths:
+      - 'Addons/AudioEQ/**'
+      - 'Scripts/audio-eq/**'
+      - 'Tools/test-audio-eq.sh'
+      - 'Sources/uYouPlusSettings.xm'
+      - 'Makefile'
+      - '.github/workflows/**'
+
+permissions:
+  contents: read
+
+jobs:
+  dsp:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: DSP and IPA regression checks
+        run: bash Tools/test-audio-eq.sh
+      - name: Undefined-behavior sanitizer
+        run: |
+          g++ -std=c++17 -O1 -g -Wall -Wextra -Werror -pthread -fsanitize=undefined \
+            -fno-sanitize-recover=all Addons/AudioEQ/AudioDSP.cpp \
+            Addons/AudioEQ/tests/AudioDSPTests.cpp -o "$RUNNER_TEMP/eq-tests"
+          "$RUNNER_TEMP/eq-tests"
+
+  compile:
+    name: Theos compile (embedded=${{ matrix.embedded }})
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        embedded: ['0', '1']
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: main
+      - name: Dependencies
+        run: brew install ldid dpkg make
+      - uses: actions/checkout@v7
+        with:
+          repository: theos/theos
+          path: theos
+          submodules: recursive
+      - name: Compile EQ and stage resources
+        env:
+          THEOS: ${{ github.workspace }}/theos
+          EMBEDDED: ${{ matrix.embedded }}
+        run: |
+          "$(brew --prefix make)/bin/gmake" -C main/Addons/AudioEQ package \
+            TARGET=iphone:clang:latest:15.0 YTAEQ_EMBEDDED="$EMBEDDED" FINALPACKAGE=1
+      - uses: actions/upload-artifact@v7
+        with:
+          name: audio-eq-development-embedded-${{ matrix.embedded }}
+          path: main/Addons/AudioEQ/packages/*.deb
+          if-no-files-found: error

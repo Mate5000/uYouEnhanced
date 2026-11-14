@@ -1,3 +1,14 @@
+## Audio EQ and bass boost
+
+This checkout adds a native **10-band Audio EQ** and adjustable **bass boost** to
+uYouEnhanced. Open **uYouEnhanced settings → Video player options → Audio EQ**, or
+**video player gear → Audio EQ**. The module is compiled into uYouEnhanced and
+requires no YouTube Plus subscription. Effects start off and settings save
+automatically.
+
+In the existing build workflow, keep **Include 10-band Audio EQ and bass boost**
+enabled. [Controls, IPA build instructions and device verification](Addons/AudioEQ/README.md).
+
 ## Lightweight Alternative - YouMod
 
 <details>

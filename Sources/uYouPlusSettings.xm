@@ -1,5 +1,8 @@
 #import "UYTFileSize.h"
 #import "uYouPlusSettings.h"
+#if UYOU_AUDIO_EQ_ENABLED
+#import "../Addons/AudioEQ/Settings.h"
+#endif
 #import "RootOptionsController.h"
 #import "ColourOptionsController.h"
 #import "ColourOptionsController2.h"
@@ -417,6 +420,18 @@ NSString *cacheDescription = [NSString stringWithFormat:@"%@", GetCacheSize()];
 
     # pragma mark - Video player options
     SECTION_HEADER(LOC(@"VIDEO_PLAYER_OPTIONS"));
+
+#if UYOU_AUDIO_EQ_ENABLED
+    __weak YTSettingsViewController *audioEQSettingsController = settingsViewController;
+    [sectionItems addObject:[YTSettingsSectionItemClass
+        itemWithTitle:YTAEQLocalize(@"Audio EQ")
+        accessibilityIdentifier:@"YTAudioEQ.settings"
+        detailTextBlock:nil
+        selectBlock:^BOOL(__unused YTSettingsCell *cell, __unused NSUInteger index) {
+            [audioEQSettingsController pushViewController:YTAEQCreatePanel()];
+            return YES;
+        }]];
+#endif
 
     SWITCH2(LOC(@"ENABLE_PORTRAIT_FULLSCREEN"), LOC(@"ENABLE_PORTRAIT_FULLSCREEN_DESC"), kPortraitFullscreen);
     SWITCH2(LOC(@"FULLSCREEN_TO_THE_RIGHT"), LOC(@"FULLSCREEN_TO_THE_RIGHT_DESC"), kFullscreenToTheRight);

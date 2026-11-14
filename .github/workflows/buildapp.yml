@@ -6,6 +6,11 @@ name: Build and Release uYouEnhanced
 on:
   workflow_dispatch:
     inputs:
+      audio_eq:
+        description: "Include 10-band Audio EQ and bass boost"
+        default: true
+        required: false
+        type: boolean
       build_ffmpeg:
         description: "Build FFmpegKit from source (cached; first run takes 30-90 min usually.)"
         default: true
@@ -84,6 +89,9 @@ jobs:
       - name: Install Dependencies
         run: |
           brew install ldid dpkg make wget unzip jq pipx meson ninja gnu-sed autoconf automake libtool pkgconf pngquant
+
+      - name: Test Audio EQ and IPA validation
+        run: bash main/Tools/test-audio-eq.sh
 
       - name: Set PATH
         run: echo "$(brew --prefix make)/libexec/gnubin" >> $GITHUB_PATH
@@ -173,13 +181,13 @@ jobs:
         uses: actions/cache/restore@v6
         with:
           path: main/modules/ffmpeg
-          key: ffmpegkit-${{ runner.os }}-${{ hashFiles('main/tools/fetch-ffmpegkit.sh') }}
+          key: ffmpegkit-${{ runner.os }}-${{ hashFiles('main/Tools/fetch-ffmpegkit.sh') }}
 
       - name: Build FFmpegKit from source
         if: ${{ inputs.build_ffmpeg && steps.ffmpeg_cache.outputs.cache-hit != 'true' }}
         run: |
           cd main
-          bash tools/fetch-ffmpegkit.sh
+          bash Tools/fetch-ffmpegkit.sh
 
       - name: Save FFmpegKit cache
         if: ${{ inputs.build_ffmpeg && steps.ffmpeg_cache.outputs.cache-hit != 'true' && hashFiles('main/modules/ffmpeg/**') != '' }}
@@ -188,19 +196,33 @@ jobs:
           path: main/modules/ffmpeg
           key: ${{ steps.ffmpeg_cache.outputs.cache-primary-key }}
 
-      - name: Fix compiling & Build Package
+      - name: Build uYouEnhanced Package
         id: build_package
         run: |
+          set -euo pipefail
           cd main
-          sed -i '' "s/^BUNDLE_ID .*/BUNDLE_ID = ${{ inputs.bundle_id }}/" Makefile || echo "BUNDLE_ID = ${{ inputs.bundle_id }}" >> Makefile
-          sed -i '' "s/^DISPLAY_NAME .*/DISPLAY_NAME = ${{ inputs.app_name }}/" Makefile || echo "DISPLAY_NAME = ${{ inputs.app_name }}" >> Makefile
-          sed -i '' "s/^export TARGET .*/export TARGET = iphone:clang:${{ inputs.sdk_version }}:15.0/" Makefile || echo "export TARGET = iphone:clang:${{ inputs.sdk_version }}:15.0" >> Makefile
-          make package THEOS_PACKAGE_SCHEME=rootless IPA=Payload/YouTube.app FINALPACKAGE=1 YTUHD_ENABLED=${{ inputs.ytuhd && '1' || '0' }} SPONSORBLOCK_ENABLED=${{ inputs.sponsorblock && '1' || '0' }}
-          echo "package=$(ls -t packages | head -n1)" >> $GITHUB_OUTPUT
+          make package THEOS_PACKAGE_SCHEME=rootless IPA=Payload/YouTube.app FINALPACKAGE=1 \
+            BUNDLE_ID="$BUNDLE_ID" DISPLAY_NAME="$DISPLAY_NAME" SDK_VERSION="$SDK_VERSION" \
+            YOUTUBE_VERSION="$YOUTUBE_VERSION" AUDIO_EQ_ENABLED="$AUDIO_EQ_ENABLED" \
+            YTUHD_ENABLED="$YTUHD_ENABLED" SPONSORBLOCK_ENABLED="$SPONSORBLOCK_ENABLED"
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          from pathlib import Path
+          packages = list(Path('packages').glob('*.ipa'))
+          if len(packages) != 1:
+              raise SystemExit(f'Expected exactly one built IPA, found {len(packages)}')
+          print(f'package={packages[0].name}')
+          PY
 
         env:
           THEOS: ${{ github.workspace }}/theos
           UYOU_VERSION: ${{ inputs.uyou_version }}
+          BUNDLE_ID: ${{ inputs.bundle_id }}
+          DISPLAY_NAME: ${{ inputs.app_name }}
+          SDK_VERSION: ${{ inputs.sdk_version }}
+          YOUTUBE_VERSION: ${{ steps.prepare_youtube.outputs.youtube_version }}
+          AUDIO_EQ_ENABLED: ${{ inputs.audio_eq && '1' || '0' }}
+          YTUHD_ENABLED: ${{ inputs.ytuhd && '1' || '0' }}
+          SPONSORBLOCK_ENABLED: ${{ inputs.sponsorblock && '1' || '0' }}
 
       - name: Clone Open in YouTube (Safari Extension)
         run: |
@@ -316,6 +338,18 @@ jobs:
             echo "No 3.0.4 in filename or file missing: $OLD"
           fi
           echo "RENAMED_IPA=$NEW" >> "$GITHUB_ENV"
+
+      - name: Verify EQ and existing features in final IPA
+        env:
+          OUTPUT_IPA: main/packages/${{ env.RENAMED_IPA || steps.strip_ipa.outputs.final_ipa }}
+          AUDIO_EQ_ENABLED: ${{ inputs.audio_eq && '1' || '0' }}
+          FFMPEG_ENABLED: ${{ inputs.build_ffmpeg && '1' || '0' }}
+          SPONSORBLOCK_ENABLED: ${{ inputs.sponsorblock && '1' || '0' }}
+          YTUHD_ENABLED: ${{ inputs.ytuhd && '1' || '0' }}
+        run: |
+          python3 main/Scripts/audio-eq/verify_ipa.py "$OUTPUT_IPA" \
+            --audio-eq "$AUDIO_EQ_ENABLED" --ffmpeg "$FFMPEG_ENABLED" \
+            --sponsorblock "$SPONSORBLOCK_ENABLED" --ytuhd "$YTUHD_ENABLED"
 
       - name: Upload Artifact
         if: ${{ inputs.upload_artifact }}
