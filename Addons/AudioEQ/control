@@ -1,6 +1,6 @@
 Package: com.ytaudioeq.tweak
 Name: YouTube Audio EQ
-Version: 1.0.1
+Version: 1.0.2
 Architecture: iphoneos-arm
 Description: In-app ten-band equalizer and adjustable bass boost for YouTube.
 Maintainer: YTAudioEQ contributors

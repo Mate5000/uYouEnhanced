@@ -33,6 +33,9 @@
 "OSStatus (decimal / hex / FourCC)" = "OSStatus (decimális / hexadecimális / FourCC)";
 "The decoder requested another compressed packet before producing the expected PCM frames. This is an adapter failure, not proof of an unsupported Bluetooth device. Original audio is preserved." = "A dekóder újabb tömörített csomagot kért a várt PCM-minták előállításához. Ez az adapter hibája; nem igazolja, hogy a Bluetooth-eszköz nem támogatott. Az eredeti hang megy tovább.";
 "Priming configuration status" = "Dekóder-előkészítés állapota";
+"Priming configuration is optional. Temporary input exhaustion is normal when all packets have been consumed; successful continuations do not reset the decoder." = "Az előkészítési beállítás opcionális. Az összes csomag elfogyása után az átmeneti bemenethiány normális; sikeres folytatáskor a dekóder nem indul újra.";
+"Successful decoder continuations" = "Sikeres dekóderfolytatások";
+"Startup padding / queued PCM frames" = "Indulási pótlás / várakozó PCM-mintaegységek";
 "Latest observed audio values" = "Legutóbb megfigyelt hangadatok";
 "Source codec / flags" = "Forráskodek / jelzőbitek";
 "Source Hz / channels / bits" = "Forrás Hz / csatornák / bitek";

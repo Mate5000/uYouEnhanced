@@ -7,7 +7,7 @@ import zipfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from verify_ipa import CORE_LIBRARIES, EQ_CLASS_MARKERS, FFMPEG_LIBRARIES, dylib_references, verify_ipa
+from verify_ipa import CORE_LIBRARIES, EQ_CLASS_MARKERS, EQ_BUILD_MARKER, FFMPEG_LIBRARIES, dylib_references, verify_ipa
 
 
 def macho(references=(), extra=b""):
@@ -36,7 +36,7 @@ class IPATests(unittest.TestCase):
             root + "uYouBundle.bundle/Info.plist": plistlib.dumps({}),
         }
         for library in libraries:
-            files[root + "Frameworks/" + library] = macho(extra=b"\0".join(marker for marker in EQ_CLASS_MARKERS if marker != missing_marker) if library == "uYouEnhanced.dylib" and eq else b"")
+            files[root + "Frameworks/" + library] = macho(extra=b"\0".join(marker for marker in (*EQ_CLASS_MARKERS, EQ_BUILD_MARKER) if marker != missing_marker) if library == "uYouEnhanced.dylib" and eq else b"")
         if eq:
             for suffix in ("Info.plist", "en.lproj/Localizable.strings", "hu.lproj/Localizable.strings", "ThirdPartyNotices.txt"):
                 files[root + "YTAudioEQ.bundle/" + suffix] = b"resources"
@@ -71,6 +71,10 @@ class IPATests(unittest.TestCase):
     def test_old_eq_build_without_diagnostics_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "YTAEQDiagnosticsViewController"):
             verify_ipa(self.package(missing_marker=b"YTAEQDiagnosticsViewController"))
+
+    def test_old_diagnostics_build_without_opus_fix_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "Opus streaming fix missing"):
+            verify_ipa(self.package(missing_marker=EQ_BUILD_MARKER))
 
     def test_existing_pip_dependency_is_retained(self):
         with self.assertRaisesRegex(ValueError, "load YouPiP.dylib exactly once"):

@@ -33,6 +33,9 @@
 "OSStatus (decimal / hex / FourCC)" = "OSStatus (decimal / hex / FourCC)";
 "The decoder requested another compressed packet before producing the expected PCM frames. This is an adapter failure, not proof of an unsupported Bluetooth device. Original audio is preserved." = "The decoder requested another compressed packet before producing the expected PCM frames. This is an adapter failure, not proof of an unsupported Bluetooth device. Original audio is preserved.";
 "Priming configuration status" = "Priming configuration status";
+"Priming configuration is optional. Temporary input exhaustion is normal when all packets have been consumed; successful continuations do not reset the decoder." = "Priming configuration is optional. Temporary input exhaustion is normal when all packets have been consumed; successful continuations do not reset the decoder.";
+"Successful decoder continuations" = "Successful decoder continuations";
+"Startup padding / queued PCM frames" = "Startup padding / queued PCM frames";
 "Latest observed audio values" = "Latest observed audio values";
 "Source codec / flags" = "Source codec / flags";
 "Source Hz / channels / bits" = "Source Hz / channels / bits";

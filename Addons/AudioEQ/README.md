@@ -77,6 +77,25 @@ Each stream has its own filter/decoder state. Settings mailboxes and the output
 registry are initialized before hooks start, independently of C++ constructor
 ordering in the combined dylib.
 
+The compressed adapter drains each input batch until its callback reports
+temporary starvation. That is a normal streaming boundary, not end-of-stream:
+the converter keeps its history for the next batch. On the reported Opus feed,
+the first 9600 input frames yielded 9480 PCM frames. The adapter compensates the
+120-frame startup delay once with leading silence (2.5 ms at 48 kHz), keeping
+the original sample-buffer timestamps and durations. Further decoded samples
+flow in order; any extra output is carried forward. Startup delay/carry is capped
+at 20 ms, and recurring short output still fails safely rather than inserting
+silence repeatedly. The final decoder delay is not explicitly drained because
+the enqueue hook has no reliable end-of-stream notification; up to that bounded
+delay can remain at the end of a stream. Device listening/sync checks remain
+required.
+
+Once a compressed stream is being decoded, disabling the effects keeps dry PCM
+flowing through the same decoder. This avoids re-priming on every switch change.
+Before the first activation, bypass passes the original sample buffers through.
+Flush, seek, format change and genuine failure clear the decoder/carry. The real
+time render callback is unchanged; codec/storage work stays on the producer queue.
+
 Unsupported codecs/layouts, invalid timestamps or decoder failures pass original
 audio through. The status row only reports active processing after an active DSP
 chain has actually processed buffers. Existing playback engines are not replaced
@@ -98,9 +117,14 @@ last failing API. The failure stage and OSStatus are captured together in one
 lock-free word. Formatting and copying happen on the UI thread.
 
 `2037671281` (`'yteq'`) means our converter input callback ran out of packets.
-The old decoder path can reject that buffer and send original audio through;
-this is not evidence that Bluetooth itself is unsupported. The diagnostic build
-identifies itself as **1.0.1-diagnostics**. After reproducing a failure, copy the
+Build 1.0.1 rejected the valid short first Opus output and reset on every batch.
+Build **1.0.2-opus-streaming** accepts the bounded startup delay and preserves the
+converter. The optional priming property can still return `'prop'`; this alone
+does not prevent processing. See Apple's
+[input callback contract](https://developer.apple.com/documentation/audiotoolbox/audioconvertercomplexinputdataproc).
+The report now includes successful decoder continuations, startup padding and
+queued PCM frames. Input-exhaustion counts can increase during normal processing;
+decoder resets must not increase with every batch. After reproducing a failure, copy the
 report while playback is running. A report with zero processed PCM frames must
 not be interpreted as a working EQ. Historical failure details are retained
 even if later buffers recover; all counters cover the current app session.
@@ -122,9 +146,14 @@ python3 Scripts/audio-eq/verify_ipa.py packages/your-build.ipa \
     --audio-eq 1 --ffmpeg 1 --sponsorblock 0 --ytuhd 0
 ```
 
-The `Audio EQ checks` workflow runs portable DSP/PCM tests, package-verifier
-tests, and Theos builds of standalone and embedded integration modes. Its
-standalone `.deb` is a development artifact; the normal app build embeds EQ in
+The `Audio EQ checks` workflow runs portable DSP/PCM tests, including the observed
+9600/9480 startup regression, sample-order/carry and mono/stereo 44.1/48 kHz cases,
+package-verifier tests, and Theos builds of standalone and embedded modes. macOS
+also runs `Tools/test-audio-decoder-apple.sh`: the production adapter decodes our
+own synthetic mono/stereo Opus packets using Apple's actual codec, checks
+continuous PTS/duration and measures the relative bass increase. This check also
+runs before the normal IPA build on macOS; it is not executed on Windows/Linux.
+The standalone `.deb` is a development artifact; the normal app build embeds EQ in
 the main tweak instead of injecting this package.
 
 The full macOS app build needs Xcode, the selected SDK, all existing submodules

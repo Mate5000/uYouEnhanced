@@ -18,6 +18,7 @@ FFMPEG_LIBRARIES = (
     "libavutil", "libswresample", "libswscale",
 )
 EQ_CLASS_MARKERS = (b"YTAEQViewController", b"YTAEQSampleState", b"YTAEQDiagnosticsViewController")
+EQ_BUILD_MARKER = b"1.0.2-opus-streaming"
 
 
 def dylib_references(data):
@@ -95,6 +96,8 @@ def verify_ipa(path, *, audio_eq=True, ffmpeg=False, sponsorblock=False, ytuhd=F
             for marker in EQ_CLASS_MARKERS:
                 if marker not in enhancer:
                     raise ValueError(f"Embedded EQ code missing: {marker.decode()}")
+            if EQ_BUILD_MARKER not in enhancer:
+                raise ValueError("Embedded EQ is stale: Opus streaming fix missing")
             for suffix in ("Info.plist", "en.lproj/Localizable.strings", "hu.lproj/Localizable.strings", "ThirdPartyNotices.txt"):
                 unique_file("YTAudioEQ.bundle/" + suffix)
         elif any(marker in enhancer for marker in EQ_CLASS_MARKERS):

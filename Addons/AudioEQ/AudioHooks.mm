@@ -1,9 +1,12 @@
 #import "AudioHooks.hpp"
+#include "DecoderPCM.hpp"
 #import <AVFoundation/AVFoundation.h>
 #import <AudioToolbox/AudioToolbox.h>
 #import <CoreMedia/CoreMedia.h>
 #import <objc/runtime.h>
+#ifndef YTAEQ_DECODER_TEST
 #import <substrate.h>
+#endif
 #import "Vendor/fishhook.h"
 #include <dlfcn.h>
 #include <limits.h>
@@ -98,6 +101,7 @@ static bool processList(Stream &stream, const PCMFormat &format, AudioBufferList
 
 // RemoteIO fallback. The notify receives its own context, never a map lookup or
 // lock on the real-time thread. One atomic word publishes a complete PCM format.
+#ifndef YTAEQ_DECODER_TEST
 struct Output {
     Stream stream;
     std::atomic<uint64_t> format{0};
@@ -248,6 +252,7 @@ static void bindApplicationImage(const struct mach_header *header, intptr_t slid
     };
     rebind_symbols_image(const_cast<struct mach_header *>(header), slide, bindings, sizeof(bindings) / sizeof(bindings[0]));
 }
+#endif
 } // namespace
 
 // AVSampleBufferAudioRenderer feeds are serialized non-real-time producer
@@ -258,7 +263,7 @@ static void bindApplicationImage(const struct mach_header *header, intptr_t slid
     AudioConverterRef decoder;
     CMFormatDescriptionRef sourceFormat;
     CMTime expectedTime;
-    std::vector<float> decoded;
+    DecoderPCM decoded;
     std::vector<uint8_t> copied;
     std::vector<AudioStreamPacketDescription> packetDescriptions;
     std::atomic<bool> resetRequested;
@@ -287,6 +292,7 @@ static void resetDecoder(YTAEQSampleState *state) {
     if (state->decoder) statistics.decoderResets.fetch_add(1, std::memory_order_relaxed);
     if (state->decoder) { AudioConverterDispose(state->decoder); state->decoder = nullptr; }
     if (state->sourceFormat) { CFRelease(state->sourceFormat); state->sourceFormat = nullptr; }
+    state->decoded.reset();
     state->expectedTime = kCMTimeInvalid;
 }
 static void copyAttachments(CMSampleBufferRef source, CMSampleBufferRef destination) {
@@ -327,7 +333,14 @@ static OSStatus supplyPackets(__unused AudioConverterRef converter, UInt32 *coun
                               AudioStreamPacketDescription **descriptions, void *context) {
     auto &input = *static_cast<PacketInput *>(context);
     statistics.requestedPackets.store(*count, std::memory_order_relaxed);
-    if (input.cursor == input.packets) { statistics.inputExhaustions.fetch_add(1, std::memory_order_relaxed); *count = 0; return NeedInput; }
+    if (input.cursor == input.packets) {
+        statistics.inputExhaustions.fetch_add(1, std::memory_order_relaxed);
+        *count = 0;
+        data->mNumberBuffers = 1;
+        data->mBuffers[0] = {input.channels, 0, nullptr};
+        if (descriptions) *descriptions = nullptr;
+        return NeedInput;
+    }
     *count = std::min(*count, input.packets - input.cursor);
     if (*count == 0) return NeedInput;
     const UInt32 first = input.cursor, last = first + *count - 1;
@@ -342,8 +355,8 @@ static OSStatus supplyPackets(__unused AudioConverterRef converter, UInt32 *coun
 }
 static CMSampleBufferRef decodeAndProcess(YTAEQSampleState *state, CMSampleBufferRef source,
                                          CMAudioFormatDescriptionRef description, const AudioStreamBasicDescription &asbd) {
-    // System codec support is checked at runtime. Never reinterpret compressed
-    // bytes as PCM, and never replace audio with a partially decoded packet.
+    // A temporary input shortage is not end-of-stream or a codec error. Keep
+    // the converter alive across buffers, including its priming/delay history.
     if (asbd.mChannelsPerFrame < 1 || asbd.mChannelsPerFrame > 2 || !std::isfinite(asbd.mSampleRate) || asbd.mSampleRate < 8000 || asbd.mSampleRate > 192000) return failure(FailureStage::UnsupportedFormat);
     const CMTime duration = CMSampleBufferGetDuration(source);
     if (!CMTIME_IS_NUMERIC(duration)) return failure(FailureStage::InvalidDuration);
@@ -403,29 +416,44 @@ static CMSampleBufferRef decodeAndProcess(YTAEQSampleState *state, CMSampleBuffe
     }
     if (!descriptions) packetFrames = uint64_t(packets) * asbd.mFramesPerPacket;
     statistics.packetFrames.store(packetFrames <= UINT32_MAX ? uint32_t(packetFrames) : UINT32_MAX, std::memory_order_relaxed);
-    state->decoded.resize((expectedFrames + 4096) * output.mChannelsPerFrame);
+    if (packetFrames && packetFrames != expectedFrames) { CFRelease(contiguous); return failure(FailureStage::DecoderFrameCount); }
+    // No unbounded queuing: at most 20 ms of startup delay/carry is supported.
+    // The reported 48 kHz Opus stream needs 120 frames (2.5 ms), not 120 frames
+    // from every buffer. Do not hardcode that codec-specific observation.
+    const UInt32 maximumDelay = static_cast<UInt32>(asbd.mSampleRate / 50);
+    try {
+        state->decoded.prepare(expectedFrames, output.mChannelsPerFrame, maximumDelay);
+        state->packetDescriptions.clear();
+        if (descriptions) state->packetDescriptions.assign(descriptions, descriptions + packets);
+    } catch (...) { CFRelease(contiguous); throw; }
     AudioBufferList list{};
     list.mNumberBuffers = 1;
-    list.mBuffers[0] = {output.mChannelsPerFrame, static_cast<UInt32>(state->decoded.size() * sizeof(float)), state->decoded.data()};
-    state->packetDescriptions.clear();
-    if (descriptions) state->packetDescriptions.assign(descriptions, descriptions + packets);
+    list.mBuffers[0] = {output.mChannelsPerFrame, state->decoded.capacity() * output.mBytesPerFrame, state->decoded.writePointer()};
     PacketInput input{bytes, static_cast<UInt32>(length), packets, asbd.mChannelsPerFrame, asbd.mBytesPerPacket,
         descriptions ? state->packetDescriptions.data() : nullptr, 0};
-    // Ask for precisely this buffer's duration. Requesting spare capacity would
-    // make the converter ask for the next packet before it has been enqueued.
-    UInt32 frames = expectedFrames;
+    // Drain all available output until supplyPackets reports temporary starvation.
+    // That callback also ends Apple's ownership of the supplied packet memory.
+    UInt32 frames = state->decoded.capacity();
     status = AudioConverterFillComplexBuffer(state->decoder, supplyPackets, &input, &frames, &list, nullptr);
     statistics.returnedFrames.store(frames, std::memory_order_relaxed);
     statistics.consumedPackets.store(input.cursor, std::memory_order_relaxed);
-    CFRelease(contiguous);
-    if ((status != noErr && status != NeedInput) || input.cursor != packets || frames != expectedFrames) {
-        // The original packet goes to Apple's renderer; discard our decoder's
-        // consumed state so it cannot emit that packet a second time later.
+    if (status != NeedInput || input.cursor != packets || list.mNumberBuffers != 1 ||
+        list.mBuffers[0].mData != state->decoded.writePointer() ||
+        uint64_t(list.mBuffers[0].mDataByteSize) < uint64_t(frames) * output.mBytesPerFrame ||
+        !state->decoded.finish(frames)) {
+        // A genuine error, incomplete packet consumption or excessive/recurring
+        // delay still preserves original audio. Dispose before releasing input.
         resetDecoder(state);
-        return failure(status == NeedInput ? FailureStage::DecoderNeedsInput : status != noErr ? FailureStage::DecoderFill : FailureStage::DecoderFrameCount,
-                       status != noErr ? status : kAudioConverterErr_InvalidOutputSize);
+        CFRelease(contiguous);
+        return failure(status != noErr && status != NeedInput ? FailureStage::DecoderFill : FailureStage::DecoderFrameCount,
+                       status != noErr && status != NeedInput ? status : kAudioConverterErr_InvalidOutputSize);
     }
-    list.mBuffers[0].mDataByteSize = frames * output.mBytesPerFrame;
+    CFRelease(contiguous);
+    statistics.decoderContinuations.fetch_add(1, std::memory_order_relaxed);
+    statistics.startupPadding.store(state->decoded.startupPadding(), std::memory_order_relaxed);
+    statistics.queuedFrames.store(state->decoded.queuedFrames(), std::memory_order_relaxed);
+    frames = expectedFrames;
+    list.mBuffers[0] = {output.mChannelsPerFrame, frames * output.mBytesPerFrame, state->decoded.data()};
     PCMFormat format;
     if (!pcmFormat(output, format)) return failure(FailureStage::UnsupportedFormat);
     state->stream.update(format.rate);
@@ -445,11 +473,19 @@ static CMSampleBufferRef processSample(YTAEQSampleState *state, CMSampleBufferRe
     const auto *asbd = CMAudioFormatDescriptionGetStreamBasicDescription(description);
     if (!asbd) return failure(FailureStage::MissingFormat);
     const CMTime pts = CMSampleBufferGetPresentationTimeStamp(source);
+    if (!CMTIME_IS_NUMERIC(pts)) return failure(FailureStage::InvalidTimestamp);
     const bool discontinuity = CMTIME_IS_NUMERIC(state->expectedTime) && CMTIME_IS_NUMERIC(pts) &&
         std::abs(CMTimeGetSeconds(CMTimeSubtract(pts, state->expectedTime))) > 0.002;
     if (discontinuity) { resetDecoder(state); state->stream.engine.clearHistory(); }
+    if (asbd->mFormatID != kAudioFormatLinearPCM) {
+        CMSampleBufferRef result = decodeAndProcess(state, source, description, *asbd);
+        // Decoder creation resets the old timeline. Publish the new end only
+        // afterwards, so a seek immediately after startup is detected too.
+        if (result) state->expectedTime = CMTimeAdd(pts, CMSampleBufferGetDuration(source));
+        return result;
+    }
+    if (state->decoder) resetDecoder(state);
     state->expectedTime = CMTimeAdd(pts, CMSampleBufferGetDuration(source));
-    if (asbd->mFormatID != kAudioFormatLinearPCM) return decodeAndProcess(state, source, description, *asbd);
     PCMFormat format;
     if (!pcmFormat(*asbd, format)) return failure(FailureStage::UnsupportedFormat);
     CMItemCount count = CMSampleBufferGetNumSamples(source);
@@ -512,16 +548,21 @@ static void enqueueSample(AVSampleBufferAudioRenderer *renderer, SEL selector, C
     if (state->resetRequested.exchange(false)) { resetDecoder(state); state->stream.engine.clearHistory(); }
     // Read configuration even while disabled so an existing wet stream fades out.
     state->stream.update(state->stream.rate > 0 ? state->stream.rate : 48000);
-    if (state->stream.engine.isBypassed()) {
+    if (state->stream.engine.isBypassed() && !state->decoder) {
         statistics.bypassedBuffers.fetch_add(1, std::memory_order_relaxed);
-        if (state->decoder) resetDecoder(state);
         state->expectedTime = kCMTimeInvalid;
         originalEnqueue(renderer, selector, source); return;
     }
     CMSampleBufferRef result = nullptr;
     try { result = processSample(state, source); }
     catch (const std::bad_alloc &) { resetDecoder(state); failure(FailureStage::OutOfMemory, kAudio_MemFullError); }
-    if (!result) unsupported(statistics.decoderError.load() ?: kAudioFormatUnsupportedDataFormatError);
+    if (!result) {
+        // Never retain decoder/filter history after passing its source through:
+        // later delayed frames must not replay audio already heard via fallback.
+        resetDecoder(state);
+        state->stream.engine.clearHistory();
+        unsupported(statistics.decoderError.load() ?: kAudioFormatUnsupportedDataFormatError);
+    } else if (!state->stream.effect) statistics.bypassedBuffers.fetch_add(1, std::memory_order_relaxed);
     originalEnqueue(renderer, selector, result ?: source);
     if (result) CFRelease(result);
 }
@@ -548,6 +589,7 @@ static void flushSampleAtTime(AVSampleBufferAudioRenderer *renderer, SEL selecto
 }
 } // namespace
 
+#ifndef YTAEQ_DECODER_TEST
 void YTAEQInstallAudioHooks() {
     (void)outputRegistry();
     originalStart = reinterpret_cast<decltype(originalStart)>(dlsym(RTLD_DEFAULT, "AudioOutputUnitStart"));
@@ -580,3 +622,4 @@ void YTAEQInstallAudioHooks() {
     });
     dispatch_resume(timer);
 }
+#endif

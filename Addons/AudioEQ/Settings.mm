@@ -75,7 +75,7 @@ NSString *YTAEQAudioDiagnosticReport() {
     const auto &stats = YTAEQAudioStatistics();
     const uint64_t lastFailure = stats.lastFailure.load();
     const auto stage = ytaeq::failureStage(lastFailure);
-    NSMutableString *report = [NSMutableString stringWithFormat:@"%@\nYTAudioEQ 1.0.1-diagnostics\n\n", YTAEQLocalize(@"Audio diagnostics")];
+    NSMutableString *report = [NSMutableString stringWithFormat:@"%@\nYTAudioEQ 1.0.2-opus-streaming\n\n", YTAEQLocalize(@"Audio diagnostics")];
     const auto append = ^(NSString *key, id value) { [report appendFormat:@"%@: %@\n", YTAEQLocalize(key), value]; };
     append(@"YouTube version", [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"?");
     append(@"iOS version", UIDevice.currentDevice.systemVersion);
@@ -90,6 +90,7 @@ NSString *YTAEQAudioDiagnosticReport() {
     if (stage == ytaeq::FailureStage::DecoderNeedsInput)
         [report appendFormat:@"%@\n", YTAEQLocalize(@"The decoder requested another compressed packet before producing the expected PCM frames. This is an adapter failure, not proof of an unsupported Bluetooth device. Original audio is preserved.")];
     append(@"Priming configuration status", errorDescription(ytaeq::failureValue(ytaeq::FailureStage::None, stats.primeStatus.load())));
+    [report appendFormat:@"%@\n", YTAEQLocalize(@"Priming configuration is optional. Temporary input exhaustion is normal when all packets have been consumed; successful continuations do not reset the decoder.")];
     [report appendFormat:@"\n%@\n", YTAEQLocalize(@"Latest observed audio values")];
     append(@"Source codec / flags", [NSString stringWithFormat:@"'%@' (0x%08x) / 0x%08x", fourCC(stats.formatID.load()), stats.formatID.load(), stats.formatFlags.load()]);
     append(@"Source Hz / channels / bits", [NSString stringWithFormat:@"%u / %u / %u", stats.sourceRate.load(), stats.channels.load(), stats.bitsPerChannel.load()]);
@@ -102,6 +103,8 @@ NSString *YTAEQAudioDiagnosticReport() {
     append(@"Processed / failed / bypassed buffers", [NSString stringWithFormat:@"%llu / %llu / %llu", (unsigned long long)stats.processedBlocks.load(), (unsigned long long)stats.unsupportedBlocks.load(), (unsigned long long)stats.bypassedBuffers.load()]);
     append(@"Processed PCM frames", @(stats.processedFrames.load()));
     append(@"Input exhausted / decoder resets / flushes", [NSString stringWithFormat:@"%llu / %llu / %llu", (unsigned long long)stats.inputExhaustions.load(), (unsigned long long)stats.decoderResets.load(), (unsigned long long)stats.flushes.load()]);
+    append(@"Successful decoder continuations", @(stats.decoderContinuations.load()));
+    append(@"Startup padding / queued PCM frames", [NSString stringWithFormat:@"%u / %u", stats.startupPadding.load(), stats.queuedFrames.load()]);
     append(@"Sample-buffer hook installed", @(stats.enqueueHookInstalled.load()));
     append(@"RemoteIO hook setup / intercepted starts / callbacks", [NSString stringWithFormat:@"%d / %llu / %llu", stats.remoteHooksInstalled.load(), (unsigned long long)stats.remoteStarts.load(), (unsigned long long)stats.remoteCallbacks.load()]);
     append(@"Import rebinding attempts / images with chained fixups", [NSString stringWithFormat:@"%llu / %llu", (unsigned long long)stats.rebindingAttempts.load(), (unsigned long long)stats.chainedImages.load()]);

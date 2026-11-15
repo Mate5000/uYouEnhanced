@@ -24,6 +24,8 @@ struct YTAEQStatistics {
     std::atomic<uint32_t> packetCount{0}, consumedPackets{0}, requestedPackets{0};
     std::atomic<uint32_t> inputBytes{0}, cookieBytes{0};
     std::atomic<uint32_t> sourceSamples{0}, packetFrames{0};
+    std::atomic<uint64_t> decoderContinuations{0};
+    std::atomic<uint32_t> startupPadding{0}, queuedFrames{0};
     std::atomic<int32_t> primeStatus{0};
     std::atomic<bool> enqueueHookInstalled{false}, remoteHooksInstalled{false};
 };
