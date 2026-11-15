@@ -17,7 +17,7 @@ FFMPEG_LIBRARIES = (
     "ffmpegkit", "libavcodec", "libavdevice", "libavfilter", "libavformat",
     "libavutil", "libswresample", "libswscale",
 )
-EQ_CLASS_MARKERS = (b"YTAEQViewController", b"YTAEQSampleState")
+EQ_CLASS_MARKERS = (b"YTAEQViewController", b"YTAEQSampleState", b"YTAEQDiagnosticsViewController")
 
 
 def dylib_references(data):

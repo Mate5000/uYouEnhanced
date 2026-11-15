@@ -8,6 +8,9 @@ on:
       - 'Scripts/audio-eq/**'
       - 'Tools/test-audio-eq.sh'
       - 'Sources/uYouPlusSettings.xm'
+      - 'Sources/AdBlocking.xm'
+      - 'Sources/UYTAdBlockPreferences.h'
+      - 'Sources/uYouPlus.xm'
       - 'Makefile'
       - '.github/workflows/**'
   push:
@@ -16,6 +19,9 @@ on:
       - 'Scripts/audio-eq/**'
       - 'Tools/test-audio-eq.sh'
       - 'Sources/uYouPlusSettings.xm'
+      - 'Sources/AdBlocking.xm'
+      - 'Sources/UYTAdBlockPreferences.h'
+      - 'Sources/uYouPlus.xm'
       - 'Makefile'
       - '.github/workflows/**'
 
@@ -49,6 +55,11 @@ jobs:
           path: main
       - name: Dependencies
         run: brew install ldid dpkg make
+      - name: Adblock preference regression tests
+        run: |
+          clang -fobjc-arc -Wall -Wextra -Werror -framework Foundation \
+            main/Scripts/audio-eq/AdBlockPreferencesTests.m -o "$RUNNER_TEMP/adblock-tests"
+          "$RUNNER_TEMP/adblock-tests"
       - uses: actions/checkout@v7
         with:
           repository: theos/theos

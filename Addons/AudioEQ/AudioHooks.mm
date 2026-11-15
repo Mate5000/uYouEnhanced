@@ -49,6 +49,20 @@ static void unsupported(OSStatus error = kAudioFormatUnsupportedDataFormatError)
     statistics.decoderError.store(error, std::memory_order_relaxed);
     statistics.unsupportedBlocks.fetch_add(1, std::memory_order_relaxed);
 }
+static CMSampleBufferRef failure(FailureStage stage, OSStatus error = kAudioFormatUnsupportedDataFormatError) {
+    statistics.decoderError.store(error, std::memory_order_relaxed);
+    statistics.lastFailure.store(failureValue(stage, error), std::memory_order_relaxed);
+    return nullptr;
+}
+static void observeFormat(const AudioStreamBasicDescription &asbd) {
+    statistics.formatID.store(asbd.mFormatID, std::memory_order_relaxed);
+    statistics.formatFlags.store(asbd.mFormatFlags, std::memory_order_relaxed);
+    statistics.channels.store(asbd.mChannelsPerFrame, std::memory_order_relaxed);
+    statistics.sourceRate.store(std::isfinite(asbd.mSampleRate) && asbd.mSampleRate > 0 && asbd.mSampleRate <= 192000 ? uint32_t(asbd.mSampleRate) : 0, std::memory_order_relaxed);
+    statistics.bitsPerChannel.store(asbd.mBitsPerChannel, std::memory_order_relaxed);
+    statistics.bytesPerFrame.store(asbd.mBytesPerFrame, std::memory_order_relaxed);
+    statistics.framesPerPacket.store(asbd.mFramesPerPacket, std::memory_order_relaxed);
+}
 static void processed(Stream &stream, std::size_t frames, unsigned backend) {
     if (!stream.effect) return;
     statistics.decoderError.store(0, std::memory_order_relaxed);
@@ -125,6 +139,7 @@ static void formatChanged(void *context, __unused AudioUnit unit, __unused Audio
 }
 static OSStatus renderOutput(void *context, AudioUnitRenderActionFlags *flags, const AudioTimeStamp *timestamp,
                              UInt32 bus, UInt32 frames, AudioBufferList *data) {
+    statistics.remoteCallbacks.fetch_add(1, std::memory_order_relaxed);
     if (!flags || !(*flags & kAudioUnitRenderAction_PostRender) || (*flags & kAudioUnitRenderAction_PostRenderError) ||
         bus != 0 || !data || frames == 0 || sampleRenderers.load(std::memory_order_relaxed)) return noErr;
     Output &output = *static_cast<Output *>(context);
@@ -132,7 +147,7 @@ static OSStatus renderOutput(void *context, AudioUnitRenderActionFlags *flags, c
     Guard guard(output.stream);
     if (!guard.acquired) return noErr;
     const uint64_t word = output.format.load(std::memory_order_acquire);
-    if (!word) { unsupported(); return noErr; }
+    if (!word) { failure(FailureStage::RemoteIOFormat); unsupported(); return noErr; }
     PCMFormat format{double(word & 0xfffff), unsigned((word >> 20) & 3), SampleType((word >> 24) & 7), bool((word >> 28) & 1)};
     output.stream.update(format.rate);
     if (word != output.lastFormat) { output.stream.engine.clearHistory(); output.hasTime = false; output.lastFormat = word; }
@@ -145,13 +160,13 @@ static OSStatus renderOutput(void *context, AudioUnitRenderActionFlags *flags, c
         // A silent buffer need not contain initialized samples. Clear it only
         // after validating all pointers and sizes.
         PCMBuffer buffers[2]{};
-        if (data->mNumberBuffers > 2) { unsupported(); return noErr; }
+        if (data->mNumberBuffers > 2) { failure(FailureStage::PCMBufferLayout); unsupported(); return noErr; }
         for (UInt32 i = 0; i < data->mNumberBuffers; ++i)
             buffers[i] = {data->mBuffers[i].mData, data->mBuffers[i].mDataByteSize, data->mBuffers[i].mNumberChannels};
-        if (!validPCM(format, buffers, data->mNumberBuffers, frames)) { unsupported(); return noErr; }
+        if (!validPCM(format, buffers, data->mNumberBuffers, frames)) { failure(FailureStage::PCMBufferLayout); unsupported(); return noErr; }
         for (UInt32 i = 0; i < data->mNumberBuffers; ++i) std::memset(data->mBuffers[i].mData, 0, data->mBuffers[i].mDataByteSize);
     }
-    if (!processList(output.stream, format, data, frames)) { unsupported(); return noErr; }
+    if (!processList(output.stream, format, data, frames)) { failure(FailureStage::PCMBufferLayout); unsupported(); return noErr; }
     // Filters can have a short tail even when the source is silent.
     *flags &= ~kAudioUnitRenderAction_OutputIsSilence;
     processed(output.stream, frames, 2);
@@ -164,6 +179,7 @@ static bool isRemoteIO(AudioUnit unit) {
            description.componentType == kAudioUnitType_Output && description.componentSubType == kAudioUnitSubType_RemoteIO;
 }
 static OSStatus startOutput(AudioUnit unit) {
+    statistics.remoteStarts.fetch_add(1, std::memory_order_relaxed);
     try { if (isRemoteIO(unit)) {
         auto &registry = outputRegistry();
         std::lock_guard<std::mutex> lock(registry.mutex);
@@ -181,7 +197,7 @@ static OSStatus startOutput(AudioUnit unit) {
                 outputs.erase(inserted.first);
             }
         } else readOutputFormat(unit, *outputs[unit]);
-    } } catch (const std::bad_alloc &) { unsupported(kAudio_MemFullError); }
+    } } catch (const std::bad_alloc &) { failure(FailureStage::OutOfMemory, kAudio_MemFullError); unsupported(kAudio_MemFullError); }
     return originalStart(unit);
 }
 static std::unique_ptr<Output> detachOutput(AudioUnit unit) {
@@ -215,6 +231,14 @@ static void bindApplicationImage(const struct mach_header *header, intptr_t slid
     const bool insideApplication = prefix && std::strncmp(info.dli_fname, applicationPath, prefix) == 0 && info.dli_fname[prefix] == '/';
     if (header->filetype != MH_EXECUTE && !insideApplication) return;
     if (std::strstr(info.dli_fname, "YTAudioEQ.dylib")) return;
+    statistics.rebindingAttempts.fetch_add(1, std::memory_order_relaxed);
+    // fishhook's indirect-symbol-table rebinder does not walk chained fixups.
+    // Report this distinction instead of claiming these imports were replaced.
+    const auto *command = reinterpret_cast<const load_command *>(reinterpret_cast<const char *>(header) + sizeof(mach_header_64));
+    for (uint32_t i = 0; i < header->ncmds; ++i) {
+        if (command->cmd == 0x80000034U) statistics.chainedImages.fetch_add(1, std::memory_order_relaxed);
+        command = reinterpret_cast<const load_command *>(reinterpret_cast<const char *>(command) + command->cmdsize);
+    }
     // Rebind imported data pointers in the app and its embedded frameworks.
     // Do not patch signed executable code or images in the system shared cache.
     struct rebinding bindings[] = {
@@ -260,6 +284,7 @@ static void (*originalFlush)(AVSampleBufferAudioRenderer *, SEL);
 static void (*originalTimedFlush)(AVSampleBufferAudioRenderer *, SEL, CMTime, void (^)(BOOL));
 
 static void resetDecoder(YTAEQSampleState *state) {
+    if (state->decoder) statistics.decoderResets.fetch_add(1, std::memory_order_relaxed);
     if (state->decoder) { AudioConverterDispose(state->decoder); state->decoder = nullptr; }
     if (state->sourceFormat) { CFRelease(state->sourceFormat); state->sourceFormat = nullptr; }
     state->expectedTime = kCMTimeInvalid;
@@ -279,7 +304,7 @@ static void copyAttachments(CMSampleBufferRef source, CMSampleBufferRef destinat
 }
 static CMSampleBufferRef makePCM(CMSampleBufferRef source, CMAudioFormatDescriptionRef description, AudioBufferList *list, UInt32 frames) {
     const auto *asbd = CMAudioFormatDescriptionGetStreamBasicDescription(description);
-    if (!asbd || !CMTIME_IS_NUMERIC(CMSampleBufferGetPresentationTimeStamp(source))) return nullptr;
+    if (!asbd || !CMTIME_IS_NUMERIC(CMSampleBufferGetPresentationTimeStamp(source))) return failure(FailureStage::InvalidTimestamp);
     CMSampleTimingInfo timing{CMTimeMake(1, static_cast<int32_t>(std::llround(asbd->mSampleRate))),
                               CMSampleBufferGetPresentationTimeStamp(source), CMSampleBufferGetDecodeTimeStamp(source)};
     CMSampleBufferRef result = nullptr;
@@ -287,7 +312,7 @@ static CMSampleBufferRef makePCM(CMSampleBufferRef source, CMAudioFormatDescript
     if (status == noErr) status = CMSampleBufferSetDataBufferFromAudioBufferList(result, kCFAllocatorDefault, kCFAllocatorDefault,
         kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment, list);
     if (status == noErr) status = CMSampleBufferSetDataReady(result);
-    if (status != noErr) { if (result) CFRelease(result); return nullptr; }
+    if (status != noErr) { if (result) CFRelease(result); return failure(FailureStage::OutputBufferCreate, status); }
     copyAttachments(source, result);
     return result;
 }
@@ -301,7 +326,8 @@ static constexpr OSStatus NeedInput = 'yteq';
 static OSStatus supplyPackets(__unused AudioConverterRef converter, UInt32 *count, AudioBufferList *data,
                               AudioStreamPacketDescription **descriptions, void *context) {
     auto &input = *static_cast<PacketInput *>(context);
-    if (input.cursor == input.packets) { *count = 0; return NeedInput; }
+    statistics.requestedPackets.store(*count, std::memory_order_relaxed);
+    if (input.cursor == input.packets) { statistics.inputExhaustions.fetch_add(1, std::memory_order_relaxed); *count = 0; return NeedInput; }
     *count = std::min(*count, input.packets - input.cursor);
     if (*count == 0) return NeedInput;
     const UInt32 first = input.cursor, last = first + *count - 1;
@@ -318,12 +344,17 @@ static CMSampleBufferRef decodeAndProcess(YTAEQSampleState *state, CMSampleBuffe
                                          CMAudioFormatDescriptionRef description, const AudioStreamBasicDescription &asbd) {
     // System codec support is checked at runtime. Never reinterpret compressed
     // bytes as PCM, and never replace audio with a partially decoded packet.
-    if (asbd.mChannelsPerFrame < 1 || asbd.mChannelsPerFrame > 2 || asbd.mSampleRate < 8000 || asbd.mSampleRate > 192000) return nullptr;
+    if (asbd.mChannelsPerFrame < 1 || asbd.mChannelsPerFrame > 2 || !std::isfinite(asbd.mSampleRate) || asbd.mSampleRate < 8000 || asbd.mSampleRate > 192000) return failure(FailureStage::UnsupportedFormat);
     const CMTime duration = CMSampleBufferGetDuration(source);
-    if (!CMTIME_IS_NUMERIC(duration)) return nullptr;
+    if (!CMTIME_IS_NUMERIC(duration)) return failure(FailureStage::InvalidDuration);
     const double estimate = CMTimeGetSeconds(duration) * asbd.mSampleRate;
-    if (!std::isfinite(estimate) || estimate < 1 || estimate > 262144) return nullptr;
+    if (!std::isfinite(estimate) || estimate < 1 || estimate > 262144) return failure(FailureStage::InvalidDuration);
     const UInt32 expectedFrames = static_cast<UInt32>(std::llround(estimate));
+    statistics.expectedFrames.store(expectedFrames, std::memory_order_relaxed);
+    statistics.returnedFrames.store(0, std::memory_order_relaxed);
+    statistics.packetCount.store(0, std::memory_order_relaxed);
+    statistics.consumedPackets.store(0, std::memory_order_relaxed);
+    statistics.packetFrames.store(0, std::memory_order_relaxed);
     AudioStreamBasicDescription output{};
     output.mSampleRate = asbd.mSampleRate; output.mFormatID = kAudioFormatLinearPCM;
     output.mFormatFlags = kAudioFormatFlagsNativeFloatPacked;
@@ -332,22 +363,23 @@ static CMSampleBufferRef decodeAndProcess(YTAEQSampleState *state, CMSampleBuffe
     if (!state->sourceFormat || !CMFormatDescriptionEqual(state->sourceFormat, description)) {
         resetDecoder(state);
         OSStatus status = AudioConverterNew(&asbd, &output, &state->decoder);
-        if (status != noErr) { statistics.decoderError.store(status); return nullptr; }
+        if (status != noErr) return failure(FailureStage::DecoderCreate, status);
         size_t cookieSize = 0;
         const void *cookie = CMAudioFormatDescriptionGetMagicCookie(description, &cookieSize);
+        statistics.cookieBytes.store(static_cast<uint32_t>(cookieSize), std::memory_order_relaxed);
         if (cookie && cookieSize) {
             status = AudioConverterSetProperty(state->decoder, kAudioConverterDecompressionMagicCookie, static_cast<UInt32>(cookieSize), cookie);
-            if (status != noErr) { statistics.decoderError.store(status); resetDecoder(state); return nullptr; }
+            if (status != noErr) { resetDecoder(state); return failure(FailureStage::DecoderCookie, status); }
         }
         UInt32 primeMethod = kConverterPrimeMethod_None;
-        AudioConverterSetProperty(state->decoder, kAudioConverterPrimeMethod, sizeof(primeMethod), &primeMethod);
+        statistics.primeStatus.store(AudioConverterSetProperty(state->decoder, kAudioConverterPrimeMethod, sizeof(primeMethod), &primeMethod), std::memory_order_relaxed);
         state->sourceFormat = (CMFormatDescriptionRef)CFRetain(description);
     }
     CMBlockBufferRef block = CMSampleBufferGetDataBuffer(source);
-    if (!block) return nullptr;
+    if (!block) return failure(FailureStage::MissingPackets);
     CMBlockBufferRef contiguous = nullptr;
     OSStatus status = CMBlockBufferCreateContiguous(kCFAllocatorDefault, block, kCFAllocatorDefault, nullptr, 0, 0, 0, &contiguous);
-    if (status != noErr) return nullptr;
+    if (status != noErr) return failure(FailureStage::MissingPackets, status);
     char *bytes = nullptr;
     size_t length = 0;
     status = CMBlockBufferGetDataPointer(contiguous, 0, nullptr, &length, &bytes);
@@ -358,13 +390,19 @@ static CMSampleBufferRef decodeAndProcess(YTAEQSampleState *state, CMSampleBuffe
     if (packetStatus == noErr && descriptionBytes && descriptionBytes % sizeof(AudioStreamPacketDescription) == 0)
         packets = static_cast<UInt32>(descriptionBytes / sizeof(AudioStreamPacketDescription));
     else if (asbd.mBytesPerPacket && length % asbd.mBytesPerPacket == 0) packets = static_cast<UInt32>(length / asbd.mBytesPerPacket);
-    if (status != noErr || !packets || packets > 8192 || length > 4194304) { CFRelease(contiguous); return nullptr; }
+    statistics.inputBytes.store(static_cast<uint32_t>(length), std::memory_order_relaxed);
+    statistics.packetCount.store(packets, std::memory_order_relaxed);
+    if (status != noErr || !packets || packets > 8192 || length > 4194304) { CFRelease(contiguous); return failure(FailureStage::MissingPackets, status != noErr ? status : kAudioFormatUnsupportedDataFormatError); }
     uint64_t previousEnd = 0;
+    uint64_t packetFrames = 0;
     for (UInt32 i = 0; descriptions && i < packets; ++i) {
         if (descriptions[i].mStartOffset < 0 || uint64_t(descriptions[i].mStartOffset) < previousEnd ||
-            uint64_t(descriptions[i].mStartOffset) + descriptions[i].mDataByteSize > length) { CFRelease(contiguous); return nullptr; }
+            uint64_t(descriptions[i].mStartOffset) + descriptions[i].mDataByteSize > length) { CFRelease(contiguous); return failure(FailureStage::PacketLayout); }
         previousEnd = uint64_t(descriptions[i].mStartOffset) + descriptions[i].mDataByteSize;
+        packetFrames += descriptions[i].mVariableFramesInPacket ?: asbd.mFramesPerPacket;
     }
+    if (!descriptions) packetFrames = uint64_t(packets) * asbd.mFramesPerPacket;
+    statistics.packetFrames.store(packetFrames <= UINT32_MAX ? uint32_t(packetFrames) : UINT32_MAX, std::memory_order_relaxed);
     state->decoded.resize((expectedFrames + 4096) * output.mChannelsPerFrame);
     AudioBufferList list{};
     list.mNumberBuffers = 1;
@@ -377,31 +415,35 @@ static CMSampleBufferRef decodeAndProcess(YTAEQSampleState *state, CMSampleBuffe
     // make the converter ask for the next packet before it has been enqueued.
     UInt32 frames = expectedFrames;
     status = AudioConverterFillComplexBuffer(state->decoder, supplyPackets, &input, &frames, &list, nullptr);
+    statistics.returnedFrames.store(frames, std::memory_order_relaxed);
+    statistics.consumedPackets.store(input.cursor, std::memory_order_relaxed);
     CFRelease(contiguous);
     if ((status != noErr && status != NeedInput) || input.cursor != packets || frames != expectedFrames) {
-        statistics.decoderError.store(status != noErr ? status : kAudioConverterErr_InvalidOutputSize);
         // The original packet goes to Apple's renderer; discard our decoder's
         // consumed state so it cannot emit that packet a second time later.
-        resetDecoder(state); return nullptr;
+        resetDecoder(state);
+        return failure(status == NeedInput ? FailureStage::DecoderNeedsInput : status != noErr ? FailureStage::DecoderFill : FailureStage::DecoderFrameCount,
+                       status != noErr ? status : kAudioConverterErr_InvalidOutputSize);
     }
     list.mBuffers[0].mDataByteSize = frames * output.mBytesPerFrame;
     PCMFormat format;
-    if (!pcmFormat(output, format)) return nullptr;
+    if (!pcmFormat(output, format)) return failure(FailureStage::UnsupportedFormat);
     state->stream.update(format.rate);
-    if (!processList(state->stream, format, &list, frames)) return nullptr;
+    if (!processList(state->stream, format, &list, frames)) return failure(FailureStage::PCMBufferLayout);
     CMAudioFormatDescriptionRef decodedDescription = nullptr;
     status = CMAudioFormatDescriptionCreate(kCFAllocatorDefault, &output, 0, nullptr, 0, nullptr, nullptr, &decodedDescription);
+    if (status != noErr) return failure(FailureStage::OutputFormat, status);
     CMSampleBufferRef result = status == noErr ? makePCM(source, decodedDescription, &list, frames) : nullptr;
     if (decodedDescription) CFRelease(decodedDescription);
     if (result) processed(state->stream, frames, 1);
     return result;
 }
 static CMSampleBufferRef processSample(YTAEQSampleState *state, CMSampleBufferRef source) {
-    if (!CMSampleBufferDataIsReady(source)) return nullptr;
+    if (!CMSampleBufferDataIsReady(source)) return failure(FailureStage::NotReady);
     CMAudioFormatDescriptionRef description = CMSampleBufferGetFormatDescription(source);
-    if (!description || CMFormatDescriptionGetMediaType(description) != kCMMediaType_Audio) return nullptr;
+    if (!description || CMFormatDescriptionGetMediaType(description) != kCMMediaType_Audio) return failure(FailureStage::MissingFormat);
     const auto *asbd = CMAudioFormatDescriptionGetStreamBasicDescription(description);
-    if (!asbd) return nullptr;
+    if (!asbd) return failure(FailureStage::MissingFormat);
     const CMTime pts = CMSampleBufferGetPresentationTimeStamp(source);
     const bool discontinuity = CMTIME_IS_NUMERIC(state->expectedTime) && CMTIME_IS_NUMERIC(pts) &&
         std::abs(CMTimeGetSeconds(CMTimeSubtract(pts, state->expectedTime))) > 0.002;
@@ -409,9 +451,9 @@ static CMSampleBufferRef processSample(YTAEQSampleState *state, CMSampleBufferRe
     state->expectedTime = CMTimeAdd(pts, CMSampleBufferGetDuration(source));
     if (asbd->mFormatID != kAudioFormatLinearPCM) return decodeAndProcess(state, source, description, *asbd);
     PCMFormat format;
-    if (!pcmFormat(*asbd, format)) return nullptr;
+    if (!pcmFormat(*asbd, format)) return failure(FailureStage::UnsupportedFormat);
     CMItemCount count = CMSampleBufferGetNumSamples(source);
-    if (count <= 0 || count > 262144) return nullptr;
+    if (count <= 0 || count > 262144) return failure(FailureStage::PCMBufferLayout);
     const UInt32 frames = static_cast<UInt32>(count);
     struct { UInt32 count; AudioBuffer buffers[2]; } storage{};
     auto *list = reinterpret_cast<AudioBufferList *>(&storage);
@@ -419,14 +461,14 @@ static CMSampleBufferRef processSample(YTAEQSampleState *state, CMSampleBufferRe
     size_t needed = 0;
     OSStatus status = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(source, &needed, list, sizeof(storage), kCFAllocatorDefault, kCFAllocatorDefault,
         kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment, &retained);
-    if (status != noErr || list->mNumberBuffers > 2) { if (retained) CFRelease(retained); return nullptr; }
+    if (status != noErr || list->mNumberBuffers > 2) { if (retained) CFRelease(retained); return failure(FailureStage::PCMBufferLayout, status != noErr ? status : kAudioFormatUnsupportedDataFormatError); }
     PCMBuffer views[2]{};
     size_t total = 0;
     for (UInt32 i = 0; i < list->mNumberBuffers; ++i) {
         views[i] = {list->mBuffers[i].mData, list->mBuffers[i].mDataByteSize, list->mBuffers[i].mNumberChannels};
         total += list->mBuffers[i].mDataByteSize;
     }
-    if (!validPCM(format, views, list->mNumberBuffers, frames) || total > 4194304) { if (retained) CFRelease(retained); return nullptr; }
+    if (!validPCM(format, views, list->mNumberBuffers, frames) || total > 4194304) { if (retained) CFRelease(retained); return failure(FailureStage::PCMBufferLayout); }
     state->copied.resize(total);
     size_t offset = 0;
     for (UInt32 i = 0; i < list->mNumberBuffers; ++i) {
@@ -436,7 +478,7 @@ static CMSampleBufferRef processSample(YTAEQSampleState *state, CMSampleBufferRe
     }
     if (retained) CFRelease(retained);
     state->stream.update(format.rate);
-    if (!processList(state->stream, format, list, frames)) return nullptr;
+    if (!processList(state->stream, format, list, frames)) return failure(FailureStage::PCMBufferLayout);
     CMSampleBufferRef result = makePCM(source, description, list, frames);
     if (result) processed(state->stream, frames, 1);
     return result;
@@ -453,25 +495,38 @@ static YTAEQSampleState *sampleState(AVSampleBufferAudioRenderer *renderer) {
 }
 static void enqueueSample(AVSampleBufferAudioRenderer *renderer, SEL selector, CMSampleBufferRef source) {
     if (!source) { originalEnqueue(renderer, selector, source); return; }
+    statistics.receivedBuffers.fetch_add(1, std::memory_order_relaxed);
+    const CMItemCount sampleCount = CMSampleBufferGetNumSamples(source);
+    statistics.sourceSamples.store(sampleCount > 0 && sampleCount <= UINT32_MAX ? uint32_t(sampleCount) : 0, std::memory_order_relaxed);
+    CMAudioFormatDescriptionRef description = CMSampleBufferGetFormatDescription(source);
+    if (description && CMFormatDescriptionGetMediaType(description) == kCMMediaType_Audio) {
+        const auto *asbd = CMAudioFormatDescriptionGetStreamBasicDescription(description);
+        if (asbd) {
+            observeFormat(*asbd);
+            (asbd->mFormatID == kAudioFormatLinearPCM ? statistics.pcmBuffers : statistics.compressedBuffers).fetch_add(1, std::memory_order_relaxed);
+        }
+    }
     YTAEQSampleState *state = sampleState(renderer);
     Guard guard(state->stream);
-    if (!guard.acquired) { state->resetRequested.store(true); originalEnqueue(renderer, selector, source); return; }
+    if (!guard.acquired) { failure(FailureStage::ConcurrentAccess, 0); state->resetRequested.store(true); originalEnqueue(renderer, selector, source); return; }
     if (state->resetRequested.exchange(false)) { resetDecoder(state); state->stream.engine.clearHistory(); }
     // Read configuration even while disabled so an existing wet stream fades out.
     state->stream.update(state->stream.rate > 0 ? state->stream.rate : 48000);
     if (state->stream.engine.isBypassed()) {
+        statistics.bypassedBuffers.fetch_add(1, std::memory_order_relaxed);
         if (state->decoder) resetDecoder(state);
         state->expectedTime = kCMTimeInvalid;
         originalEnqueue(renderer, selector, source); return;
     }
     CMSampleBufferRef result = nullptr;
     try { result = processSample(state, source); }
-    catch (const std::bad_alloc &) { resetDecoder(state); statistics.decoderError.store(kAudio_MemFullError); }
+    catch (const std::bad_alloc &) { resetDecoder(state); failure(FailureStage::OutOfMemory, kAudio_MemFullError); }
     if (!result) unsupported(statistics.decoderError.load() ?: kAudioFormatUnsupportedDataFormatError);
     originalEnqueue(renderer, selector, result ?: source);
     if (result) CFRelease(result);
 }
 static void flushSample(AVSampleBufferAudioRenderer *renderer, SEL selector) {
+    statistics.flushes.fetch_add(1, std::memory_order_relaxed);
     YTAEQSampleState *state = objc_getAssociatedObject(renderer, &sampleStateKey);
     originalFlush(renderer, selector);
     if (state) {
@@ -499,10 +554,15 @@ void YTAEQInstallAudioHooks() {
     originalUninitialize = reinterpret_cast<decltype(originalUninitialize)>(dlsym(RTLD_DEFAULT, "AudioUnitUninitialize"));
     originalDispose = reinterpret_cast<decltype(originalDispose)>(dlsym(RTLD_DEFAULT, "AudioComponentInstanceDispose"));
     strlcpy(applicationPath, NSBundle.mainBundle.bundlePath.fileSystemRepresentation, sizeof(applicationPath));
-    if (originalStart && originalUninitialize && originalDispose) _dyld_register_func_for_add_image(bindApplicationImage);
+    if (originalStart && originalUninitialize && originalDispose) {
+        statistics.remoteHooksInstalled.store(true);
+        _dyld_register_func_for_add_image(bindApplicationImage);
+    }
     Class renderer = NSClassFromString(@"AVSampleBufferAudioRenderer");
-    if (class_getInstanceMethod(renderer, @selector(enqueueSampleBuffer:)))
+    if (class_getInstanceMethod(renderer, @selector(enqueueSampleBuffer:))) {
         MSHookMessageEx(renderer, @selector(enqueueSampleBuffer:), reinterpret_cast<IMP>(&enqueueSample), reinterpret_cast<IMP *>(&originalEnqueue));
+        statistics.enqueueHookInstalled.store(originalEnqueue != nullptr);
+    }
     if (class_getInstanceMethod(renderer, @selector(flush)))
         MSHookMessageEx(renderer, @selector(flush), reinterpret_cast<IMP>(&flushSample), reinterpret_cast<IMP *>(&originalFlush));
     SEL timedFlush = @selector(flushFromSourceTime:completionHandler:);

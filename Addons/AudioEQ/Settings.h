@@ -8,3 +8,4 @@ ytaeq::Configuration YTAEQCurrentConfiguration();
 void YTAEQSaveConfiguration(ytaeq::Configuration configuration);
 void YTAEQPresentPanel(id responder, UIView *sourceView);
 UIViewController *YTAEQCreatePanel();
+NSString *YTAEQAudioDiagnosticReport(); // main thread only

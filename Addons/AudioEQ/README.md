@@ -87,6 +87,35 @@ submitted audio, so prequeued buffers can delay when a slider change is heard.
 
 ## Verification
 
+### On-device diagnostics
+
+In either EQ panel, open **Diagnostics → Show detailed diagnostics**, or use
+**Copy diagnostics**. The screen refreshes once per second; the report also
+contains the YouTube/iOS versions, output route, effect settings, codec FourCC,
+source format, converter priming status, expected/returned PCM frames,
+available/consumed/requested packets, hook callback counters and the precise
+last failing API. The failure stage and OSStatus are captured together in one
+lock-free word. Formatting and copying happen on the UI thread.
+
+`2037671281` (`'yteq'`) means our converter input callback ran out of packets.
+The old decoder path can reject that buffer and send original audio through;
+this is not evidence that Bluetooth itself is unsupported. The diagnostic build
+identifies itself as **1.0.1-diagnostics**. After reproducing a failure, copy the
+report while playback is running. A report with zero processed PCM frames must
+not be interpreted as a working EQ. Historical failure details are retained
+even if later buffers recover; all counters cover the current app session.
+
+Static inspection of the supplied YouTube 21.07.4 IPA confirmed the
+`AVSampleBufferAudioRenderer` import, `HAMSBARAudioTrackRenderer` class and
+chained fixups. Legacy fishhook rebinding does not walk chained fixups, so its
+setup alone cannot establish that the RemoteIO fallback intercepts playback.
+The report distinguishes setup attempts from actually observed callbacks.
+
+The app's adblock preference initialization now happens before its hooks are
+selected, and player-response getters/counts are replaced rather than merely
+added. Existing choices remain saved. This does not establish compatibility
+with every server-side ad delivery variation; check playback on the device.
+
 ```sh
 bash Tools/test-audio-eq.sh
 python3 Scripts/audio-eq/verify_ipa.py packages/your-build.ipa \

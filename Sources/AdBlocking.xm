@@ -1,23 +1,23 @@
 
 #import "uYouPlus.h"
 #import "UYTLog.h"
+#import "UYTAdBlockPreferences.h"
 
-%group uYouAdBlockingWorkaroundLite
+%group uYouAdBlockingCore
 %hook YTGlobalConfig
 - (BOOL)shouldBlockUpgradeDialog { return YES; }
 %end
 %hook YTIPlayerResponse
-%new(@@:)
 - (NSMutableArray *)playerAdsArray {
     return [NSMutableArray array];
 }
-%new(@@:)
 - (NSMutableArray *)adSlotsArray {
     return [NSMutableArray array];
 }
+- (NSUInteger)playerAdsArray_Count { return 0; }
+- (NSUInteger)adSlotsArray_Count { return 0; }
 %end
 %hook YTIClientMdxGlobalConfig
-%new(B@:)
 - (BOOL)enableSkippableAd { return YES; }
 %end
 %hook YTHotConfig
@@ -41,40 +41,6 @@
 %end
 
 %group uYouAdBlockingWorkaround
-%hook YTGlobalConfig
-- (BOOL)shouldBlockUpgradeDialog { return YES; }
-%end
-%hook YTIPlayerResponse
-%new(@@:)
-- (NSMutableArray *)playerAdsArray {
-    return [NSMutableArray array];
-}
-%new(@@:)
-- (NSMutableArray *)adSlotsArray {
-    return [NSMutableArray array];
-}
-%end
-%hook YTIClientMdxGlobalConfig
-%new(B@:)
-- (BOOL)enableSkippableAd { return YES; }
-%end
-%hook YTHotConfig
-- (BOOL)clientInfraClientConfigIosEnableFillingEncodedHacksInnertubeContext { return NO; }
-%end
-%hook YTAdShieldUtils
-+ (id)spamSignalsDictionary { return @{}; }
-+ (id)spamSignalsDictionaryWithoutIDFA { return @{}; }
-%end
-%hook YTDataUtils
-+ (id)spamSignalsDictionary { return @{ @"ms": @"" }; }
-+ (id)spamSignalsDictionaryWithoutIDFA { return @{}; }
-%end
-%hook YTLocalPlaybackController
-- (id)createAdsPlaybackCoordinator { return nil; }
-%end
-%hook MDXSession
-- (void)adPlaying:(id)ad {}
-%end
 %hook MDXSessionImpl
 - (void)adPlaying:(id)ad {}
 %end
@@ -288,8 +254,9 @@ static NSArray *filteredSectionEntries(NSArray *entries) {
 %end
 
 %ctor {
-    if (IS_ENABLED(kAdBlockWorkaroundLite)) {
-        %init(uYouAdBlockingWorkaroundLite);
+    UYTInitializeAdBlockPreferences(NSUserDefaults.standardUserDefaults);
+    if (IS_ENABLED(kAdBlockWorkaroundLite) || IS_ENABLED(kAdBlockWorkaround)) {
+        %init(uYouAdBlockingCore);
     }
     if (IS_ENABLED(kAdBlockWorkaround)) {
         %init(uYouAdBlockingWorkaround);

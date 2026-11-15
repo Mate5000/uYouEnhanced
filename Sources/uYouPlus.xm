@@ -1,5 +1,6 @@
 #import "uYouPlus.h"
 #import "UYTLog.h"
+#import "UYTAdBlockPreferences.h"
 #import "uYouPlusPatches.h"
 
 #pragma mark - Localization Bundle
@@ -2026,16 +2027,7 @@ static NSMutableArray <YTIItemSectionRenderer *> *filteredShortsArray(NSArray <Y
     if (![allKeys containsObject:kReplaceYTDownloadWithuYou]) {
         [[NSUserDefaults standardUserDefaults] setBool:YES forKey:kReplaceYTDownloadWithuYou];
     }
-    if (![allKeys containsObject:kAdBlockWorkaroundLite]) {
-        [[NSUserDefaults standardUserDefaults] setBool:YES forKey:kAdBlockWorkaroundLite];
-        [[NSUserDefaults standardUserDefaults] setBool:NO forKey:kAdBlockWorkaround];
-        [[NSUserDefaults standardUserDefaults] setBool:NO forKey:@"removeYouTubeAds"];
-    }
-    if (![allKeys containsObject:kAdBlockWorkaround]) {
-        [[NSUserDefaults standardUserDefaults] setBool:NO forKey:kAdBlockWorkaroundLite];
-        [[NSUserDefaults standardUserDefaults] setBool:YES forKey:kAdBlockWorkaround];
-        [[NSUserDefaults standardUserDefaults] setBool:NO forKey:@"removeYouTubeAds"];
-    }
+    UYTInitializeAdBlockPreferences(NSUserDefaults.standardUserDefaults);
     if (![allKeys containsObject:@"noSuggestedVideoAtEnd"]) {
         [[NSUserDefaults standardUserDefaults] setBool:YES forKey:@"noSuggestedVideoAtEnd"];
     }

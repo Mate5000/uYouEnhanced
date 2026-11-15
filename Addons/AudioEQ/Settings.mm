@@ -1,5 +1,6 @@
 #import "Settings.h"
 #import "AudioHooks.hpp"
+#import <AVFoundation/AVFoundation.h>
 
 static NSUserDefaults *preferences;
 static NSBundle *resources;
@@ -57,6 +58,113 @@ void YTAEQSaveConfiguration(ytaeq::Configuration value) {
     } forKey:@"configuration"];
     YTAEQConfigurationMailbox().publish(configuration);
 }
+
+static NSString *fourCC(uint32_t value) {
+    char code[5] = {};
+    for (unsigned i = 0; i < 4; ++i) {
+        const char c = char((value >> ((3 - i) * 8)) & 255);
+        code[i] = c >= 32 && c <= 126 ? c : '.';
+    }
+    return [NSString stringWithUTF8String:code];
+}
+static NSString *errorDescription(uint64_t value) {
+    const int32_t status = ytaeq::failureStatus(value);
+    return [NSString stringWithFormat:@"%d / 0x%08x / '%@'", status, uint32_t(status), fourCC(uint32_t(status))];
+}
+NSString *YTAEQAudioDiagnosticReport() {
+    const auto &stats = YTAEQAudioStatistics();
+    const uint64_t lastFailure = stats.lastFailure.load();
+    const auto stage = ytaeq::failureStage(lastFailure);
+    NSMutableString *report = [NSMutableString stringWithFormat:@"%@\nYTAudioEQ 1.0.1-diagnostics\n\n", YTAEQLocalize(@"Audio diagnostics")];
+    const auto append = ^(NSString *key, id value) { [report appendFormat:@"%@: %@\n", YTAEQLocalize(key), value]; };
+    append(@"YouTube version", [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"?");
+    append(@"iOS version", UIDevice.currentDevice.systemVersion);
+    append(@"Master / Bass / EQ", [NSString stringWithFormat:@"%d / %d / %d", configuration.enabled, configuration.bassEnabled, configuration.eqEnabled]);
+    append(@"Bass frequency / gain / ceiling", [NSString stringWithFormat:@"%.0f Hz / %.1f dB / %.1f dB", configuration.bassFrequency, configuration.bassGain, configuration.bassMaxGain]);
+    NSMutableArray *bands = [NSMutableArray array];
+    for (float gain : configuration.bands) [bands addObject:[NSString stringWithFormat:@"%+.1f", gain]];
+    append(@"EQ bands (dB)", [bands componentsJoinedByString:@", "]);
+    [report appendFormat:@"\n%@\n", YTAEQLocalize(@"Last recorded failure (retained after recovery)")];
+    append(@"Failure stage", [NSString stringWithUTF8String:ytaeq::failureStageName(stage)]);
+    append(@"OSStatus (decimal / hex / FourCC)", errorDescription(lastFailure));
+    if (stage == ytaeq::FailureStage::DecoderNeedsInput)
+        [report appendFormat:@"%@\n", YTAEQLocalize(@"The decoder requested another compressed packet before producing the expected PCM frames. This is an adapter failure, not proof of an unsupported Bluetooth device. Original audio is preserved.")];
+    append(@"Priming configuration status", errorDescription(ytaeq::failureValue(ytaeq::FailureStage::None, stats.primeStatus.load())));
+    [report appendFormat:@"\n%@\n", YTAEQLocalize(@"Latest observed audio values")];
+    append(@"Source codec / flags", [NSString stringWithFormat:@"'%@' (0x%08x) / 0x%08x", fourCC(stats.formatID.load()), stats.formatID.load(), stats.formatFlags.load()]);
+    append(@"Source Hz / channels / bits", [NSString stringWithFormat:@"%u / %u / %u", stats.sourceRate.load(), stats.channels.load(), stats.bitsPerChannel.load()]);
+    append(@"Bytes per frame / frames per packet", [NSString stringWithFormat:@"%u / %u", stats.bytesPerFrame.load(), stats.framesPerPacket.load()]);
+    append(@"Expected / decoded PCM frames", [NSString stringWithFormat:@"%u / %u", stats.expectedFrames.load(), stats.returnedFrames.load()]);
+    append(@"Source samples / frames described by packets", [NSString stringWithFormat:@"%u / %u", stats.sourceSamples.load(), stats.packetFrames.load()]);
+    append(@"Available / consumed / requested packets", [NSString stringWithFormat:@"%u / %u / %u", stats.packetCount.load(), stats.consumedPackets.load(), stats.requestedPackets.load()]);
+    append(@"Compressed bytes / codec cookie bytes", [NSString stringWithFormat:@"%u / %u", stats.inputBytes.load(), stats.cookieBytes.load()]);
+    append(@"Received / compressed / PCM buffers", [NSString stringWithFormat:@"%llu / %llu / %llu", (unsigned long long)stats.receivedBuffers.load(), (unsigned long long)stats.compressedBuffers.load(), (unsigned long long)stats.pcmBuffers.load()]);
+    append(@"Processed / failed / bypassed buffers", [NSString stringWithFormat:@"%llu / %llu / %llu", (unsigned long long)stats.processedBlocks.load(), (unsigned long long)stats.unsupportedBlocks.load(), (unsigned long long)stats.bypassedBuffers.load()]);
+    append(@"Processed PCM frames", @(stats.processedFrames.load()));
+    append(@"Input exhausted / decoder resets / flushes", [NSString stringWithFormat:@"%llu / %llu / %llu", (unsigned long long)stats.inputExhaustions.load(), (unsigned long long)stats.decoderResets.load(), (unsigned long long)stats.flushes.load()]);
+    append(@"Sample-buffer hook installed", @(stats.enqueueHookInstalled.load()));
+    append(@"RemoteIO hook setup / intercepted starts / callbacks", [NSString stringWithFormat:@"%d / %llu / %llu", stats.remoteHooksInstalled.load(), (unsigned long long)stats.remoteStarts.load(), (unsigned long long)stats.remoteCallbacks.load()]);
+    append(@"Import rebinding attempts / images with chained fixups", [NSString stringWithFormat:@"%llu / %llu", (unsigned long long)stats.rebindingAttempts.load(), (unsigned long long)stats.chainedImages.load()]);
+    if (stats.chainedImages.load()) [report appendFormat:@"%@\n", YTAEQLocalize(@"Chained fixups were detected. The legacy import rebinder does not confirm access to those Core Audio calls; the callback counters above show what was actually intercepted.")];
+    AVAudioSession *session = AVAudioSession.sharedInstance;
+    NSMutableArray *outputs = [NSMutableArray array];
+    for (AVAudioSessionPortDescription *port in session.currentRoute.outputs)
+        [outputs addObject:[NSString stringWithFormat:@"%@ (%@)", port.portType, port.portName]];
+    append(@"Output route", [outputs componentsJoinedByString:@", "]);
+    append(@"Device Hz / IO buffer seconds", [NSString stringWithFormat:@"%.0f / %.4f", session.sampleRate, session.IOBufferDuration]);
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    append(@"Adblock Lite / Full / legacy uYou", [NSString stringWithFormat:@"%@ / %@ / %@", [defaults objectForKey:@"adBlockWorkaroundLite_enabled"] ?: @"unset", [defaults objectForKey:@"adBlockWorkaround_enabled"] ?: @"unset", [defaults objectForKey:@"removeYouTubeAds"] ?: @"unset"]);
+    [report appendFormat:@"\n%@", YTAEQLocalize(@"Counters are cumulative for this app session. Latest values may come from different streams. Zero processed frames means no EQ effect has been confirmed.")];
+    return report;
+}
+
+@interface YTAEQDiagnosticsViewController : UIViewController
+@property(nonatomic, strong) UITextView *textView;
+@property(nonatomic, strong) NSTimer *timer;
+@end
+@implementation YTAEQDiagnosticsViewController
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.title = YTAEQLocalize(@"Audio diagnostics");
+    self.view.backgroundColor = UIColor.systemBackgroundColor;
+    self.textView = [[UITextView alloc] initWithFrame:CGRectZero];
+    self.textView.editable = NO;
+    self.textView.selectable = YES;
+    self.textView.font = [UIFont monospacedSystemFontOfSize:14 weight:UIFontWeightRegular];
+    self.textView.adjustsFontForContentSizeCategory = YES;
+    self.textView.textColor = UIColor.labelColor;
+    self.textView.backgroundColor = UIColor.systemBackgroundColor;
+    self.textView.accessibilityIdentifier = @"YTAudioEQ.diagnostics";
+    self.textView.translatesAutoresizingMaskIntoConstraints = NO;
+    self.textView.textContainerInset = UIEdgeInsetsMake(16, 12, 24, 12);
+    [self.view addSubview:self.textView];
+    UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
+    [NSLayoutConstraint activateConstraints:@[
+        [self.textView.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor],
+        [self.textView.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor],
+        [self.textView.topAnchor constraintEqualToAnchor:safe.topAnchor],
+        [self.textView.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor]
+    ]];
+    self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:YTAEQLocalize(@"Copy diagnostics") style:UIBarButtonItemStylePlain target:self action:@selector(copyDiagnostics)];
+    if (self.navigationController.viewControllers.firstObject == self)
+        self.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone target:self action:@selector(closeDiagnostics)];
+}
+- (void)refreshDiagnostics {
+    if (self.textView.selectedRange.length) return;
+    CGPoint offset = self.textView.contentOffset;
+    self.textView.text = YTAEQAudioDiagnosticReport();
+    [self.textView setContentOffset:offset animated:NO];
+}
+- (void)viewWillAppear:(BOOL)animated {
+    [super viewWillAppear:animated];
+    [self refreshDiagnostics];
+    __weak YTAEQDiagnosticsViewController *weakSelf = self;
+    self.timer = [NSTimer scheduledTimerWithTimeInterval:1 repeats:YES block:^(__unused NSTimer *timer) { [weakSelf refreshDiagnostics]; }];
+}
+- (void)viewDidDisappear:(BOOL)animated { [super viewDidDisappear:animated]; [self.timer invalidate]; self.timer = nil; }
+- (void)copyDiagnostics { UIPasteboard.generalPasteboard.string = YTAEQAudioDiagnosticReport(); }
+- (void)closeDiagnostics { [self dismissViewControllerAnimated:YES completion:nil]; }
+@end
 
 @interface YTAEQSliderCell : UITableViewCell
 @property(nonatomic, strong) UILabel *valueLabel;
@@ -118,12 +226,12 @@ void YTAEQSaveConfiguration(ytaeq::Configuration value) {
     [self.statusTimer invalidate]; self.statusTimer = nil;
 }
 - (void)closePanel { [self dismissViewControllerAnimated:YES completion:nil]; }
-- (NSInteger)numberOfSectionsInTableView:(__unused UITableView *)tableView { return 4; }
+- (NSInteger)numberOfSectionsInTableView:(__unused UITableView *)tableView { return 5; }
 - (NSInteger)tableView:(__unused UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
     return section == 0 ? 2 : section == 1 ? 4 : section == 2 ? 11 : 2;
 }
 - (NSString *)tableView:(__unused UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
-    return YTAEQLocalize(@[@"Audio EQ", @"Bass boost", @"10-band equalizer", @"Reset"][section]);
+    return YTAEQLocalize(@[@"Audio EQ", @"Bass boost", @"10-band equalizer", @"Reset", @"Diagnostics"][section]);
 }
 - (NSString *)tableView:(__unused UITableView *)tableView titleForFooterInSection:(NSInteger)section {
     if (section == 0) return YTAEQLocalize(@"Changes are saved automatically and apply to all videos. Enable Bass boost or Equalizer as well as the master switch.");
@@ -140,8 +248,9 @@ void YTAEQSaveConfiguration(ytaeq::Configuration value) {
     const uint64_t blocks = stats.processedBlocks.load();
     const uint64_t unsupported = stats.unsupportedBlocks.load();
     NSString *status;
-    if (unsupported > self.lastUnsupported) {
-        status = [NSString stringWithFormat:@"%@ (%d)", YTAEQLocalize(@"Unsupported audio — original audio"), stats.decoderError.load()];
+    if (unsupported > self.lastUnsupported || (unsupported && blocks == 0)) {
+        const uint64_t value = stats.lastFailure.load();
+        status = [NSString stringWithFormat:@"%@\n%s\n%@", YTAEQLocalize(@"Audio processing failed — original audio"), ytaeq::failureStageName(ytaeq::failureStage(value)), errorDescription(value)];
     } else if (blocks > self.lastBlocks) {
         NSString *backend = stats.backend.load() == 1 ? @"AVFoundation" : @"Core Audio";
         status = [NSString stringWithFormat:YTAEQLocalize(@"Active: %@, %u Hz, %llu processed buffers"), backend, stats.sampleRate.load(), (unsigned long long)blocks];
@@ -194,6 +303,10 @@ void YTAEQSaveConfiguration(ytaeq::Configuration value) {
     if (section == 0) {
         cell.textLabel.text = [self statusText]; cell.textLabel.textColor = UIColor.secondaryLabelColor;
         cell.selectionStyle = UITableViewCellSelectionStyleNone;
+    } else if (section == 4) {
+        cell.textLabel.text = YTAEQLocalize(row == 0 ? @"Show detailed diagnostics" : @"Copy diagnostics");
+        cell.textLabel.textColor = self.view.tintColor;
+        if (row == 0) cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
     } else {
         cell.textLabel.text = YTAEQLocalize(row == 0 ? @"Reset equalizer to flat" : @"Reset all audio settings");
         cell.textLabel.textColor = self.view.tintColor;
@@ -244,6 +357,15 @@ void YTAEQSaveConfiguration(ytaeq::Configuration value) {
 }
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
+    if (indexPath.section == 4) {
+        if (indexPath.row == 0) {
+            UIViewController *diagnostics = [YTAEQDiagnosticsViewController new];
+            if (self.navigationController) [self.navigationController pushViewController:diagnostics animated:YES];
+            else [self presentViewController:[[UINavigationController alloc] initWithRootViewController:diagnostics] animated:YES completion:nil];
+        }
+        else UIPasteboard.generalPasteboard.string = YTAEQAudioDiagnosticReport();
+        return;
+    }
     if (indexPath.section != 3) return;
     auto next = configuration;
     if (indexPath.row == 0) next.bands = {};

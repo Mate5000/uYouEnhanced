@@ -20,7 +20,7 @@ def macho(references=(), extra=b""):
 
 
 class IPATests(unittest.TestCase):
-    def package(self, *, eq=True, skip=(), duplicate=None, reference_skip=(), ffmpeg=False, optional=False, standalone=False):
+    def package(self, *, eq=True, skip=(), duplicate=None, reference_skip=(), ffmpeg=False, optional=False, standalone=False, missing_marker=None):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         path = Path(temporary.name) / "uYouEnhanced.ipa"
@@ -36,7 +36,7 @@ class IPATests(unittest.TestCase):
             root + "uYouBundle.bundle/Info.plist": plistlib.dumps({}),
         }
         for library in libraries:
-            files[root + "Frameworks/" + library] = macho(extra=b"\0".join(EQ_CLASS_MARKERS) if library == "uYouEnhanced.dylib" and eq else b"")
+            files[root + "Frameworks/" + library] = macho(extra=b"\0".join(marker for marker in EQ_CLASS_MARKERS if marker != missing_marker) if library == "uYouEnhanced.dylib" and eq else b"")
         if eq:
             for suffix in ("Info.plist", "en.lproj/Localizable.strings", "hu.lproj/Localizable.strings", "ThirdPartyNotices.txt"):
                 files[root + "YTAudioEQ.bundle/" + suffix] = b"resources"
@@ -67,6 +67,10 @@ class IPATests(unittest.TestCase):
     def test_missing_translation(self):
         with self.assertRaisesRegex(ValueError, "hu.lproj"):
             verify_ipa(self.package(skip=("hu.lproj",)))
+
+    def test_old_eq_build_without_diagnostics_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "YTAEQDiagnosticsViewController"):
+            verify_ipa(self.package(missing_marker=b"YTAEQDiagnosticsViewController"))
 
     def test_existing_pip_dependency_is_retained(self):
         with self.assertRaisesRegex(ValueError, "load YouPiP.dylib exactly once"):
